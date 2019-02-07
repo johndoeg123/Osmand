@@ -194,6 +194,12 @@ class TelegramSettings(private val app: TelegramApplication) {
 		currentSharingMode = sharingMode
 	}
 
+	fun clearTdLibBufferCounter() {
+		shareChatsInfo.forEach { (_, shareInfo) ->
+			shareInfo.pendingTdLib = 0
+		}
+	}
+
 	fun getChatLivePeriod(chatId: Long) = shareChatsInfo[chatId]?.livePeriod
 
 	fun getChatsShareInfo() = shareChatsInfo
@@ -264,10 +270,12 @@ class TelegramSettings(private val app: TelegramApplication) {
 					} else {
 						shareInfo.currentMapMessageId = message.id
 						shareInfo.pendingMapMessage = false
-						shareInfo.pendingTdLib--
 						shareInfo.lastSuccessfulSendTimeMs = Math.max(message.editDate, message.date) * 1000L
-						if (shareTypeValue == SHARE_TYPE_MAP) {
-							shareInfo.sentMessages++
+						if (!app.telegramHelper.isOsmAndBot(message.senderUserId) && !app.telegramHelper.isOsmAndBot(message.viaBotUserId)) {
+							shareInfo.pendingTdLib--
+							if (shareTypeValue == SHARE_TYPE_MAP) {
+								shareInfo.sentMessages++
+							}
 						}
 						log.debug("updateShareInfo MAP ${message.id} SUCCESS pendingTdLib: ${shareInfo.pendingTdLib}")
 					}
@@ -288,9 +296,11 @@ class TelegramSettings(private val app: TelegramApplication) {
 						shareInfo.currentTextMessageId = message.id
 						shareInfo.updateTextMessageId++
 						shareInfo.pendingTextMessage = false
-						shareInfo.pendingTdLib--
-						shareInfo.sentMessages++
 						shareInfo.lastSuccessfulSendTimeMs = Math.max(message.editDate, message.date) * 1000L
+						if (!app.telegramHelper.isOsmAndBot(message.senderUserId) && !app.telegramHelper.isOsmAndBot(message.viaBotUserId)) {
+							shareInfo.pendingTdLib--
+							shareInfo.sentMessages++
+						}
 						log.debug("updateShareInfo TEXT ${message.id} SUCCESS pendingTdLib: ${shareInfo.pendingTdLib}")
 					}
 				}
@@ -441,11 +451,13 @@ class TelegramSettings(private val app: TelegramApplication) {
 		val currentMapMessageId = shareChatsInfo[chatId]?.currentMapMessageId
 		if (messages.contains(currentMapMessageId)) {
 			shareChatsInfo[chatId]?.currentMapMessageId = -1
+			shareChatsInfo[chatId]?.shouldSendViaBotMessage = true
 		}
 		val currentTextMessageId = shareChatsInfo[chatId]?.currentTextMessageId
 		if (messages.contains(currentTextMessageId)) {
 			shareChatsInfo[chatId]?.currentTextMessageId = -1
 			shareChatsInfo[chatId]?.updateTextMessageId = 1
+			shareChatsInfo[chatId]?.shouldSendViaBotMessage = true
 		}
 	}
 	

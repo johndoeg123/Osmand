@@ -74,6 +74,9 @@ class SharingStatusBottomSheet : DialogFragment() {
 					if (sharingStatusType.canResendLocation) {
 						if (i == 0) {
 							setOnClickListener {
+								app.settings.clearTdLibBufferCounter()
+								app.shareLocationHelper.checkNetworkType()
+								app.shareLocationHelper.checkAndSendBufferMessages()
 								app.forceUpdateMyLocation()
 								dismiss()
 							}

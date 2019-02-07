@@ -25,6 +25,7 @@ class LocationMessages(val app: TelegramApplication) {
 	init {
 		dbHelper = SQLiteHelper(app)
 		readBufferedMessages()
+		readLastMessages()
 	}
 
 	fun getBufferedMessages(): List<BufferMessage> {
@@ -61,11 +62,12 @@ class LocationMessages(val app: TelegramApplication) {
 
 	fun addNewLocationMessage(message: TdApi.Message) {
 		log.debug("addNewLocationMessage ${message.id}")
-		val type = OsmandLocationUtils.getMessageType(message, app.telegramHelper)
-
-		val newItem = LocationHistoryPoint(message.senderUserId, message.chatId, type)
+		val type = OsmandLocationUtils.getMessageType(message)
+		val content = OsmandLocationUtils.parseMessageContent(message, app.telegramHelper)
+		val deviceName = if (content is OsmandLocationUtils.MessageOsmAndBotLocation) content.deviceName else ""
+		val newItem = LocationHistoryPoint(message.senderUserId, message.chatId, type, deviceName)
 		val previousMessageLatLon = lastLocationPoints[newItem]
-		val locationMessage = OsmandLocationUtils.parseMessage(message, app.telegramHelper, previousMessageLatLon)
+		val locationMessage = OsmandLocationUtils.createLocationMessage(message, app.telegramHelper, content, previousMessageLatLon)
 		if (locationMessage != null) {
 			dbHelper.addLocationMessage(locationMessage)
 			lastLocationPoints[newItem] = LatLon(locationMessage.lat, locationMessage.lon)
@@ -75,11 +77,11 @@ class LocationMessages(val app: TelegramApplication) {
 	fun addMyLocationMessage(loc: Location) {
 		log.debug("addMyLocationMessage")
 		val currentUserId = app.telegramHelper.getCurrentUserId()
-		val newItem = LocationHistoryPoint(currentUserId, 0, -1)
+		val newItem = LocationHistoryPoint(currentUserId, 0, LocationMessages.TYPE_MY_LOCATION, "")
 		val previousMessageLatLon = lastLocationPoints[newItem]
 		val distance = if (previousMessageLatLon != null) { MapUtils.getDistance(previousMessageLatLon, loc.latitude, loc.longitude) } else 0.0
 		val message = LocationMessages.LocationMessage(currentUserId, 0, loc.latitude, loc.longitude, loc.altitude,
-			loc.speed.toDouble(), loc.accuracy.toDouble(), loc.bearing.toDouble(), loc.time, TYPE_MY_LOCATION, 0, distance)
+			loc.speed.toDouble(), loc.accuracy.toDouble(), loc.bearing.toDouble(), loc.time, TYPE_MY_LOCATION, 0, distance, "")
 
 		dbHelper.addLocationMessage(message)
 		lastLocationPoints[newItem] = LatLon(message.lat, message.lon)
@@ -104,7 +106,9 @@ class LocationMessages(val app: TelegramApplication) {
 	}
 
 	fun getBufferedMessagesCountForChat(chatId: Long): Int {
-		return bufferedMessages.count { it.chatId == chatId }
+		val bif = bufferedMessages.count { it.chatId == chatId }
+		log.debug("bufMes $bif" )
+		return bif
 	}
 
 	private fun readBufferedMessages() {
@@ -133,13 +137,13 @@ class LocationMessages(val app: TelegramApplication) {
 		internal fun addBufferedMessage(message: BufferMessage) {
 			writableDatabase?.execSQL(BUFFER_TABLE_INSERT,
 				arrayOf(message.chatId, message.lat, message.lon, message.altitude, message.speed,
-					message.hdop, message.bearing, message.time, message.type))
+					message.hdop, message.bearing, message.time, message.type, message.deviceName))
 		}
 
 		internal fun addLocationMessage(message: LocationMessage) {
 			writableDatabase?.execSQL(TIMELINE_TABLE_INSERT,
 				arrayOf(message.userId, message.chatId, message.lat, message.lon, message.altitude, message.speed,
-					message.hdop, message.bearing, message.time, message.type, message.messageId, message.distanceFromPrev))
+					message.hdop, message.bearing, message.time, message.type, message.messageId, message.distanceFromPrev, message.deviceName))
 		}
 
 		internal fun getMessagesForUser(userId: Int, start: Long, end: Long): List<LocationMessage> {
@@ -151,19 +155,6 @@ class LocationMessages(val app: TelegramApplication) {
 					do {
 						res.add(readLocationMessage(this@apply))
 					} while (moveToNext())
-				}
-				close()
-			}
-			return res
-		}
-
-		internal fun getPreviousMessage(userId: Int, chatId: Long): LocationMessage? {
-			var res:LocationMessage? = null
-			readableDatabase?.rawQuery(
-				"$TIMELINE_TABLE_SELECT WHERE $COL_USER_ID = ? AND $COL_CHAT_ID = ? ORDER BY $COL_TIME DESC LIMIT 1",
-				arrayOf(userId.toString(), chatId.toString()))?.apply {
-				if (moveToFirst()) {
-					res = readLocationMessage(this@apply)
 				}
 				close()
 			}
@@ -187,42 +178,35 @@ class LocationMessages(val app: TelegramApplication) {
 
 		internal fun getIngoingUserLocations(start: Long, end: Long): List<UserLocations> {
 			val res = arrayListOf<UserLocations>()
-			readableDatabase?.rawQuery(
-				"$TIMELINE_TABLE_SELECT WHERE $COL_TIME BETWEEN $start AND $end ORDER BY $COL_USER_ID, $COL_CHAT_ID, $COL_TYPE DESC, $COL_TIME ", null
-				)?.apply {
+			readableDatabase?.rawQuery("$TIMELINE_TABLE_SELECT WHERE $COL_TIME BETWEEN $start AND $end ORDER BY $COL_USER_ID, $COL_CHAT_ID, $COL_TYPE DESC, $COL_TIME ", null)?.apply {
 				if (moveToFirst()) {
-					var userId = -1
-					var chatId = -1L
-					// TODO query bot name
-					var botName = ""
+					var userId: Int
+					var chatId: Long
+					var deviceName: String
 					var userLocations: UserLocations? = null
 					var userLocationsMap: MutableMap<Int, MutableList<UserTrkSegment>>? = null
-					var userLocationsListByType: MutableList<LocationMessage>? = null
 					var segment: UserTrkSegment? = null
 					do {
 						val locationMessage = readLocationMessage(this@apply)
 						userId = locationMessage.userId
 						chatId = locationMessage.chatId
-						// TODO compare bot name as well
-						if(userLocations == null || userLocations.userId != userId ||
-							userLocations.chatId != chatId) {
+						deviceName = locationMessage.deviceName
+						if (userLocations == null || userLocations.userId != userId ||
+							userLocations.chatId != chatId || userLocations.deviceName != deviceName) {
 							userLocationsMap = mutableMapOf()
-							userLocations = UserLocations(userId, chatId, botName, userLocationsMap)
+							userLocations = UserLocations(userId, chatId, deviceName, userLocationsMap)
 							res.add(userLocations)
 							segment = null
 						}
-						if(segment == null ||
-							segment.type != locationMessage.type || locationMessage.time - segment.maxTime > 30 * 1000 * 60) {
-							segment = UserTrkSegment(mutableListOf(), 0.0, locationMessage.type,
-								locationMessage.time, locationMessage.time)
-							if(userLocationsMap!![segment.type] == null) {
+						if (segment == null || segment.type != locationMessage.type || locationMessage.time - segment.maxTime > 30 * 1000 * 60) {
+							segment = UserTrkSegment(mutableListOf(), 0.0, locationMessage.type, locationMessage.time, locationMessage.time)
+							if (userLocationsMap!![segment.type] == null) {
 								userLocationsMap[segment.type] = mutableListOf()
 							}
 							userLocationsMap[segment.type]!!.add(segment)
 						}
-						if(segment.points.size > 0) {
-							segment.distance += MapUtils.getDistance(locationMessage.lat,
-								locationMessage.lon, segment.points.last().lat, segment.points.last().lon)
+						if (segment.points.size > 0) {
+							segment.distance += MapUtils.getDistance(locationMessage.lat, locationMessage.lon, segment.points.last().lat, segment.points.last().lon)
 						}
 						segment.maxTime = locationMessage.time
 						segment.points.add(locationMessage)
@@ -287,8 +271,9 @@ class LocationMessages(val app: TelegramApplication) {
 			val type = cursor.getInt(9)
 			val messageId = cursor.getLong(10)
 			val distanceFromPrev = cursor.getDouble(11)
+			val botName = cursor.getString(12)
 
-			return LocationMessage(userId, chatId, lat, lon, altitude, speed, hdop, bearing, date, type, messageId, distanceFromPrev)
+			return LocationMessage(userId, chatId, lat, lon, altitude, speed, hdop, bearing, date, type, messageId, distanceFromPrev, botName)
 		}
 
 		internal fun readBufferMessage(cursor: Cursor): BufferMessage {
@@ -301,18 +286,9 @@ class LocationMessages(val app: TelegramApplication) {
 			val bearing = cursor.getDouble(6)
 			val date = cursor.getLong(7)
 			val type = cursor.getInt(8)
+			val botName = cursor.getString(9)
 
-			return BufferMessage(chatId, lat, lon, altitude, speed, hdop, bearing, date, type)
-		}
-
-		internal fun readLocationHistoryPoint(cursor: Cursor): Pair<LocationHistoryPoint, LatLon> {
-			val userId = cursor.getInt(0)
-			val chatId = cursor.getLong(1)
-			val lat = cursor.getDouble(2)
-			val lon = cursor.getDouble(3)
-			val type = cursor.getInt(4)
-
-			return Pair(LocationHistoryPoint(userId, chatId, type), LatLon(lat, lon))
+			return BufferMessage(chatId, lat, lon, altitude, speed, hdop, bearing, date, type, botName)
 		}
 
 		internal fun clearBufferedMessages() {
@@ -340,7 +316,7 @@ class LocationMessages(val app: TelegramApplication) {
 		companion object {
 
 			private const val DATABASE_NAME = "location_messages"
-			private const val DATABASE_VERSION = 5
+			private const val DATABASE_VERSION = 6
 
 			private const val TIMELINE_TABLE_NAME = "timeline"
 			private const val BUFFER_TABLE_NAME = "buffer"
@@ -357,18 +333,19 @@ class LocationMessages(val app: TelegramApplication) {
 			private const val COL_TYPE = "type" // 0 = user map message, 1 = user text message, 2 = bot map message, 3 = bot text message
 			private const val COL_MESSAGE_ID = "message_id"
 			private const val COL_DISTANCE_FROM_PREV = "distance_from_prev"
+			private const val COL_DEVICE_NAME = "device_name"
 
 			private const val DATE_INDEX = "date_index"
 
 			// Timeline messages table
 			private const val TIMELINE_TABLE_INSERT =
-				("INSERT INTO $TIMELINE_TABLE_NAME ($COL_USER_ID, $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE,  $COL_MESSAGE_ID,  $COL_DISTANCE_FROM_PREV) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+				("INSERT INTO $TIMELINE_TABLE_NAME ($COL_USER_ID, $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE,  $COL_MESSAGE_ID,  $COL_DISTANCE_FROM_PREV,  $COL_DEVICE_NAME) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 
 			private const val TIMELINE_TABLE_CREATE =
-				("CREATE TABLE IF NOT EXISTS $TIMELINE_TABLE_NAME ($COL_USER_ID long, $COL_CHAT_ID long,$COL_LAT double, $COL_LON double, $COL_ALTITUDE double, $COL_SPEED float, $COL_HDOP double, $COL_BEARING double, $COL_TIME long, $COL_TYPE int, $COL_MESSAGE_ID long, $COL_DISTANCE_FROM_PREV double )")
+				("CREATE TABLE IF NOT EXISTS $TIMELINE_TABLE_NAME ($COL_USER_ID long, $COL_CHAT_ID long,$COL_LAT double, $COL_LON double, $COL_ALTITUDE double, $COL_SPEED float, $COL_HDOP double, $COL_BEARING double, $COL_TIME long, $COL_TYPE int, $COL_MESSAGE_ID long, $COL_DISTANCE_FROM_PREV double, $COL_DEVICE_NAME TEXT NOT NULL DEFAULT '')")
 
 			private const val TIMELINE_TABLE_SELECT =
-				"SELECT $COL_USER_ID, $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE, $COL_MESSAGE_ID, $COL_DISTANCE_FROM_PREV FROM $TIMELINE_TABLE_NAME"
+				"SELECT $COL_USER_ID, $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE, $COL_MESSAGE_ID, $COL_DISTANCE_FROM_PREV, $COL_DEVICE_NAME FROM $TIMELINE_TABLE_NAME"
 
 			private const val TIMELINE_TABLE_SELECT_HISTORY_POINTS =
 				"SELECT $COL_USER_ID, $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_TIME, $COL_TYPE FROM $TIMELINE_TABLE_NAME"
@@ -379,17 +356,17 @@ class LocationMessages(val app: TelegramApplication) {
 
 			// Buffer messages table
 			private const val BUFFER_TABLE_INSERT =
-					("INSERT INTO $BUFFER_TABLE_NAME ($COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+				("INSERT INTO $BUFFER_TABLE_NAME ($COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE,  $COL_DEVICE_NAME) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 
 			private const val BUFFER_TABLE_CREATE =
-					("CREATE TABLE IF NOT EXISTS $BUFFER_TABLE_NAME ($COL_CHAT_ID long, $COL_LAT double, $COL_LON double, $COL_ALTITUDE double, $COL_SPEED float, $COL_HDOP double, $COL_BEARING double, $COL_TIME long, $COL_TYPE int)")
+				("CREATE TABLE IF NOT EXISTS $BUFFER_TABLE_NAME ($COL_CHAT_ID long, $COL_LAT double, $COL_LON double, $COL_ALTITUDE double, $COL_SPEED float, $COL_HDOP double, $COL_BEARING double, $COL_TIME long, $COL_TYPE int,  $COL_DEVICE_NAME TEXT NOT NULL DEFAULT '')")
 
 			private const val BUFFER_TABLE_SELECT =
-					"SELECT $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE FROM $BUFFER_TABLE_NAME"
+				"SELECT $COL_CHAT_ID, $COL_LAT, $COL_LON, $COL_ALTITUDE, $COL_SPEED, $COL_HDOP, $COL_BEARING, $COL_TIME, $COL_TYPE, $COL_DEVICE_NAME FROM $BUFFER_TABLE_NAME"
 
 			private const val BUFFER_TABLE_CLEAR = "DELETE FROM $BUFFER_TABLE_NAME"
 
-			private const val BUFFER_TABLE_REMOVE = "DELETE FROM $BUFFER_TABLE_NAME  WHERE $COL_CHAT_ID = ? AND $COL_LAT = ? AND $COL_LON = ? AND $COL_ALTITUDE = ? AND $COL_SPEED = ? AND $COL_HDOP = ? AND $COL_BEARING = ? AND $COL_TIME = ? AND $COL_TYPE = ?"
+			private const val BUFFER_TABLE_REMOVE = "DELETE FROM $BUFFER_TABLE_NAME  WHERE $COL_CHAT_ID = ? AND $COL_LAT = ? AND $COL_LON = ? AND $COL_ALTITUDE = ? AND $COL_SPEED = ? AND $COL_HDOP = ? AND $COL_BEARING = ? AND $COL_TIME = ? AND $COL_TYPE = ? AND $COL_DEVICE_NAME = ?"
 
 			private const val BUFFER_TABLE_DELETE = "DROP TABLE IF EXISTS $BUFFER_TABLE_NAME"
 		}
@@ -407,7 +384,8 @@ class LocationMessages(val app: TelegramApplication) {
 		val time: Long,
 		val type: Int,
 		val messageId: Long,
-		val distanceFromPrev: Double)
+		val distanceFromPrev: Double,
+		val deviceName: String)
 
 	data class BufferMessage (
 		val chatId: Long,
@@ -418,32 +396,30 @@ class LocationMessages(val app: TelegramApplication) {
 		val hdop: Double,
 		val bearing: Double,
 		val time: Long,
-		val type: Int)
+		val type: Int,
+		val deviceName: String)
 
 	data class UserLocations(
-		var userId: Int,
-		var chatId: Long,
-		var botName: String,
-		var locationsByType: Map<Int, List<UserTrkSegment>>
-
-
-	){
+		val userId: Int,
+		val chatId: Long,
+		val deviceName: String,
+		val locationsByType: Map<Int, List<UserTrkSegment>>
+	) {
 		fun getUniqueSegments(): List<UserTrkSegment> {
-			// TODO TYPE_BOT_MAP. TYPE_BOT_TEXT, TYPE_USER_BOTH, TYPE_BOT_BOTH - delete
 			val list = mutableListOf<UserTrkSegment>()
-			if(locationsByType.containsKey(TYPE_MY_LOCATION)) {
-				return locationsByType.get(TYPE_MY_LOCATION)?: list
+			if (locationsByType.containsKey(TYPE_MY_LOCATION)) {
+				return locationsByType[TYPE_MY_LOCATION] ?: list
 			}
-			list.addAll(locationsByType.get(TYPE_USER_TEXT)?: emptyList())
-			val mapList = locationsByType.get(TYPE_USER_MAP)?: emptyList();
+			list.addAll(locationsByType[TYPE_TEXT] ?: emptyList())
+			val mapList = locationsByType[TYPE_MAP] ?: emptyList()
 			mapList.forEach {
-				var ti = 0;
-				while(ti < list.size && list[ti].maxTime < it.minTime) {
-					ti++;
+				var ti = 0
+				while (ti < list.size && list[ti].maxTime < it.minTime) {
+					ti++
 				}
-				if(ti < list.size  && list[ti].minTime > it.maxTime ) {
+				if (ti < list.size && list[ti].minTime > it.maxTime) {
 					list.add(ti, it)
-				} else if(ti == list.size) {
+				} else if (ti == list.size) {
 					list.add(it)
 				}
 			}
@@ -461,25 +437,23 @@ class LocationMessages(val app: TelegramApplication) {
 		var maxTime: Long
 	) {
 		fun newer(other: UserTrkSegment): Boolean {
-			return other.maxTime < maxTime;
+			return other.maxTime < maxTime
 		}
-
 
 		fun overlap(other: UserTrkSegment): Boolean {
-
-			if(other.maxTime < maxTime) {
-				return other.maxTime > minTime;
+			return if (other.maxTime < maxTime) {
+				other.maxTime > minTime
 			} else {
-				return other.minTime < maxTime;
+				other.minTime < maxTime
 			}
 		}
-
 	}
 
 	data class LocationHistoryPoint(
 		val userId: Int,
 		val chatId: Long,
-		val type: Int
+		val type: Int,
+		val deviceName: String
 	) {
 
 		override fun equals(other: Any?): Boolean {
@@ -506,12 +480,8 @@ class LocationMessages(val app: TelegramApplication) {
 
 	companion object {
 
-		const val TYPE_USER_MAP = 0
-		const val TYPE_USER_TEXT = 1
-		const val TYPE_USER_BOTH = 2
-		const val TYPE_BOT_MAP = 3
-		const val TYPE_BOT_TEXT = 4
-		const val TYPE_BOT_BOTH = 5
-		const val TYPE_MY_LOCATION = 6
+		const val TYPE_MAP = 0
+		const val TYPE_TEXT = 1
+		const val TYPE_MY_LOCATION = 3
 	}
 }
